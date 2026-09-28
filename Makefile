@@ -43,7 +43,9 @@ wlr-layer-shell-unstable-v1-protocol.c: wlr-layer-shell-unstable-v1.xml
 .libs/%.a: | .libs
 	@src=$$(ls /usr/lib/*-linux-gnu/$*.a 2>/dev/null || ls /usr/lib/$*.a 2>/dev/null); \
 	cp "$$src" $@; \
-	objcopy --remove-section=.sframe $@
+	if readelf -S $@ 2>/dev/null | grep -q '\.sframe'; then \
+		objcopy --remove-section=.sframe $@; \
+	fi
 
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
