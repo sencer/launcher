@@ -389,6 +389,11 @@ void ui_compute_layout(LauncherState *state, uint32_t width, uint32_t height) {
 
     if (state->filtered_count > 0) {
         state->selected_idx = clamp_i(state->selected_idx, 0, (int)state->filtered_count - 1);
+        int total_rows = ((int)state->filtered_count + cols - 1) / cols;
+        int max_scroll = total_rows - visible_rows;
+        if (max_scroll < 0) max_scroll = 0;
+        if (state->scroll_row > max_scroll) state->scroll_row = max_scroll;
+
         int sel_row = state->selected_idx / cols;
         if (sel_row < state->scroll_row) {
             state->scroll_row = sel_row;
@@ -662,11 +667,11 @@ void ui_render_frame(LauncherState *state, uint32_t *argb_buf, uint32_t width, u
         s_last_w = width;
         s_last_h = height;
     } else {
-        /* Only clear textbox and grid bounding boxes back to 0xEB16181E */
+        /* Only clear textbox, error banner, and grid bounding boxes back to 0xEB16181E */
         int tb_x0 = clamp_i(l->textbox_x - 4, 0, (int)width);
         int tb_x1 = clamp_i(l->textbox_x + l->textbox_w + 4, 0, (int)width);
         int tb_y0 = clamp_i(l->textbox_y - 4, 0, (int)height);
-        int tb_y1 = clamp_i(l->textbox_y + l->textbox_h + 4, 0, (int)height);
+        int tb_y1 = clamp_i(l->textbox_y + l->textbox_h + 46, 0, (int)height);
 
         for (int y = tb_y0; y < tb_y1; y++) {
             uint32_t *row = &argb_buf[y * width];
@@ -695,7 +700,9 @@ void ui_render_frame(LauncherState *state, uint32_t *argb_buf, uint32_t width, u
 
     /* 1. TOP-CENTER TEXTBOX */
     uint32_t border_col = 0xFF586875;
-    if (state->path_status == PATH_STATUS_VALID) {
+    if (state->error_msg[0] != '\0') {
+        border_col = 0xFFE74C3C; // bright red on command error
+    } else if (state->path_status == PATH_STATUS_VALID) {
         border_col = 0xFF2ECC71; // bright green
     } else if (state->path_status == PATH_STATUS_INVALID) {
         border_col = 0xFFE74C3C; // bright red
@@ -791,6 +798,55 @@ void ui_render_frame(LauncherState *state, uint32_t *argb_buf, uint32_t width, u
                       pill_x, pill_y, pill_w, pill_h,
                       4, pill_bg, 0, 0);
     render_text(argb_buf, width, height, 1, mode_str, pill_x + 7, pill_y + 17, 0xFFECEFF4);
+
+    /* Error Banner below textbox when a command failed */
+    if (state->error_msg[0] != '\0') {
+        int err_x = l->textbox_x;
+        int err_y = l->textbox_y + l->textbox_h + 6;
+        int err_w = l->textbox_w;
+        int err_h = 30;
+
+        /* Semi-transparent dark red card with red border */
+        draw_rounded_rect(argb_buf, width, height,
+                          err_x, err_y, err_w, err_h,
+                          6, 0xF2351A20, 0xFFE74C3C, 1);
+
+        /* Format text truncated to fit */
+        int max_err_w = err_w - 24;
+        char disp_err[256];
+        const char *src_err = state->error_msg;
+        int dots_w = measure_text_width(1, "...");
+
+        int cur_w = 0;
+        const char *p = src_err;
+        int last_fit_byte = 0;
+        bool truncated = false;
+
+        while (*p) {
+            uint32_t cp = decode_utf8(&p);
+            CachedGlyph *g = get_glyph(1, cp);
+            int adv = g ? g->advance_x : 0;
+            if (cur_w + adv + dots_w <= max_err_w) {
+                last_fit_byte = p - src_err;
+            }
+            cur_w += adv;
+            if (cur_w > max_err_w) {
+                truncated = true;
+                break;
+            }
+        }
+
+        if (truncated && last_fit_byte > 0 && last_fit_byte < 240) {
+            memcpy(disp_err, src_err, last_fit_byte);
+            disp_err[last_fit_byte] = '\0';
+            strcat(disp_err, "...");
+        } else {
+            strncpy(disp_err, src_err, sizeof(disp_err) - 1);
+            disp_err[sizeof(disp_err) - 1] = '\0';
+        }
+
+        render_text(argb_buf, width, height, 1, disp_err, err_x + 12, err_y + 20, 0xFFFFB4B4);
+    }
 
     /* 2. APP GRID */
     if (l->cols <= 0 || l->visible_rows <= 0) return;

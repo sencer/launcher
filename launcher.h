@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <xkbcommon/xkbcommon.h>
 
+#ifndef LAUNCHER_VERSION
+#define LAUNCHER_VERSION "0.1.1"
+#endif
+
 #define ICON_SIZE 64
 #define MAX_APPS 512
 #define MAX_QUERY 256
@@ -82,6 +86,7 @@ typedef struct {
 
     bool running;
     bool needs_redraw;
+    char error_msg[256];
 } LauncherState;
 
 /* desktop_cache.c */
@@ -91,7 +96,7 @@ void cache_record_launch(LauncherState *state, int app_index);
 void filter_apps(LauncherState *state);
 PathStatus check_path_executable(const char *query);
 int launch_desktop_app(const AppEntry *app);
-int launch_raw_command(const char *cmd);
+int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size);
 
 /* vim_input.c */
 void vim_init(LauncherState *state);

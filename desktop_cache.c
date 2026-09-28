@@ -8,14 +8,17 @@
 #include <limits.h>
 #include <math.h>
 #include <png.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <ft2build.h>
@@ -1355,18 +1358,9 @@ void filter_apps(LauncherState *state) {
         }
     }
 
-    /* Clamp selected_idx and scroll_row */
-    if (state->filtered_count == 0) {
-        state->selected_idx = 0;
-        state->scroll_row = 0;
-    } else {
-        if (state->selected_idx >= (int)state->filtered_count) {
-            state->selected_idx = (int)state->filtered_count - 1;
-        }
-        if (state->selected_idx < 0) {
-            state->selected_idx = 0;
-        }
-    }
+    /* Reset selection and scroll position to top when filter changes */
+    state->selected_idx = 0;
+    state->scroll_row = 0;
 
     state->needs_redraw = true;
 }
@@ -1491,7 +1485,7 @@ static void setup_detached_child(void) {
     }
 }
 
-int launch_raw_command(const char *cmd) {
+static int launch_detached_command(const char *cmd) {
     if (!cmd || cmd[0] == '\0') return -1;
 
     pid_t pid = fork();
@@ -1516,6 +1510,377 @@ int launch_raw_command(const char *cmd) {
     /* Parent waits for first child */
     int status;
     waitpid(pid, &status, 0);
+    return 0;
+}
+
+typedef struct {
+    int exit_code;
+    char msg[256];
+} RawCmdReport;
+
+/* Strip shell prefixes like "zsh:kill:1: ", "zsh:1: ", "bash: line 1: ", "sh: 1: " */
+static void clean_stderr_line(const char *raw, char *out, size_t out_max) {
+    if (!out || out_max == 0) return;
+    out[0] = '\0';
+    if (!raw) return;
+
+    while (*raw && (*raw == ' ' || *raw == '\t' || *raw == '\r' || *raw == '\n')) {
+        raw++;
+    }
+    if (*raw == '\0') return;
+
+    char line[512];
+    size_t l = 0;
+    while (raw[l] && raw[l] != '\n' && raw[l] != '\r' && l + 1 < sizeof(line)) {
+        line[l] = raw[l];
+        l++;
+    }
+    line[l] = '\0';
+
+    const char *p = line;
+
+    /* Handle "zsh:..." prefixes */
+    if (strncmp(p, "zsh:", 4) == 0) {
+        const char *after_zsh = p + 4;
+        /* Case 1: "zsh:<line>: <msg>" */
+        const char *q = after_zsh;
+        while (isdigit((unsigned char)*q)) q++;
+        if (q > after_zsh && strncmp(q, ": ", 2) == 0) {
+            p = q + 2;
+        } else {
+            /* Case 2: "zsh:<builtin>:<line>: <msg>" -> "<builtin>: <msg>" */
+            const char *colon = strchr(after_zsh, ':');
+            if (colon && colon > after_zsh) {
+                const char *r = colon + 1;
+                while (isdigit((unsigned char)*r)) r++;
+                if (r > colon + 1 && strncmp(r, ": ", 2) == 0) {
+                    size_t b_len = (size_t)(colon - after_zsh);
+                    snprintf(out, out_max, "%.*s: %s", (int)b_len, after_zsh, r + 2);
+                    return;
+                }
+            }
+        }
+    } else {
+        /* Handle "<shell>: line <N>: <msg>" or "<shell>: <N>: <msg>" */
+        const char *colon = strchr(p, ':');
+        if (colon && colon[1] == ' ') {
+            const char *after_c = colon + 2;
+            if (strncmp(after_c, "line ", 5) == 0) {
+                const char *q = after_c + 5;
+                while (isdigit((unsigned char)*q)) q++;
+                if (q > after_c + 5 && strncmp(q, ": ", 2) == 0) {
+                    p = q + 2;
+                }
+            } else if (isdigit((unsigned char)*after_c)) {
+                const char *q = after_c;
+                while (isdigit((unsigned char)*q)) q++;
+                if (strncmp(q, ": ", 2) == 0) {
+                    p = q + 2;
+                }
+            }
+        }
+    }
+
+    strncpy(out, p, out_max - 1);
+    out[out_max - 1] = '\0';
+}
+
+static void exec_user_shell(const char *cmd) {
+    const char *shell = getenv("SHELL");
+    if (shell && shell[0] == '/' && access(shell, X_OK) == 0) {
+        const char *base = strrchr(shell, '/');
+        base = base ? (base + 1) : shell;
+        execl(shell, base, "-c", cmd, (char *)NULL);
+    }
+    if (access("/bin/bash", X_OK) == 0) {
+        execl("/bin/bash", "bash", "-c", cmd, (char *)NULL);
+    }
+    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+    _exit(127);
+}
+
+int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
+    if (err_out && err_out_size > 0) {
+        err_out[0] = '\0';
+    }
+    if (!cmd || cmd[0] == '\0') return -1;
+
+    int status_pipe[2];
+    if (pipe2(status_pipe, O_CLOEXEC) != 0) {
+        return launch_detached_command(cmd);
+    }
+
+    pid_t pid1 = fork();
+    if (pid1 < 0) {
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        return -1;
+    }
+
+    if (pid1 == 0) {
+        /* First child: double-fork monitor so it is reparented to init immediately */
+        close(status_pipe[0]);
+
+        pid_t pid2 = fork();
+        if (pid2 < 0) {
+            _exit(1);
+        }
+        if (pid2 > 0) {
+            _exit(0);
+        }
+
+        /* Monitor process (grandchild) */
+        setsid();
+        signal(SIGCHLD, SIG_DFL);
+        signal(SIGHUP, SIG_IGN);
+        signal(SIGINT, SIG_IGN);
+        signal(SIGQUIT, SIG_IGN);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGPIPE, SIG_IGN);
+
+        int err_pipe[2];
+        if (pipe2(err_pipe, O_CLOEXEC) != 0) {
+            close(status_pipe[1]);
+            _exit(1);
+        }
+
+        pid_t cmd_pid = fork();
+        if (cmd_pid < 0) {
+            close(err_pipe[0]);
+            close(err_pipe[1]);
+            close(status_pipe[1]);
+            _exit(1);
+        }
+
+        if (cmd_pid == 0) {
+            /* Command process */
+            signal(SIGHUP, SIG_DFL);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
+            signal(SIGTERM, SIG_DFL);
+            signal(SIGPIPE, SIG_DFL);
+
+            int devnull = open("/dev/null", O_RDWR);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                dup2(devnull, STDOUT_FILENO);
+                if (devnull > 2) close(devnull);
+            }
+            dup2(err_pipe[1], STDERR_FILENO);
+
+            int max_fd = (int)sysconf(_SC_OPEN_MAX);
+            if (max_fd < 0 || max_fd > 1024) max_fd = 1024;
+            for (int fd = 3; fd < max_fd; fd++) {
+                close(fd);
+            }
+
+            exec_user_shell(cmd);
+        }
+
+        /* Monitor process continues */
+        close(err_pipe[1]);
+
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            if (err_pipe[0] != STDIN_FILENO && status_pipe[1] != STDIN_FILENO)
+                dup2(devnull, STDIN_FILENO);
+            if (err_pipe[0] != STDOUT_FILENO && status_pipe[1] != STDOUT_FILENO)
+                dup2(devnull, STDOUT_FILENO);
+            if (err_pipe[0] != STDERR_FILENO && status_pipe[1] != STDERR_FILENO)
+                dup2(devnull, STDERR_FILENO);
+            if (devnull > 2 && devnull != err_pipe[0] && devnull != status_pipe[1])
+                close(devnull);
+        }
+
+        int max_fd = (int)sysconf(_SC_OPEN_MAX);
+        if (max_fd < 0 || max_fd > 1024) max_fd = 1024;
+        for (int fd = 3; fd < max_fd; fd++) {
+            if (fd != err_pipe[0] && fd != status_pipe[1]) {
+                close(fd);
+            }
+        }
+
+        int flags = fcntl(err_pipe[0], F_GETFL, 0);
+        if (flags >= 0) {
+            fcntl(err_pipe[0], F_SETFL, flags | O_NONBLOCK);
+        }
+
+        int pidfd = -1;
+#ifdef SYS_pidfd_open
+        pidfd = (int)syscall(SYS_pidfd_open, cmd_pid, 0);
+#endif
+
+        char raw_err[512];
+        size_t raw_err_len = 0;
+        raw_err[0] = '\0';
+
+        int cmd_status = 0;
+        for (;;) {
+            struct pollfd pfds[2];
+            pfds[0].fd = err_pipe[0];
+            pfds[0].events = POLLIN;
+            pfds[0].revents = 0;
+            pfds[1].fd = pidfd;
+            pfds[1].events = (pidfd >= 0) ? POLLIN : 0;
+            pfds[1].revents = 0;
+
+            int timeout_ms = (pidfd >= 0) ? -1 : 15;
+            poll(pfds, (pidfd >= 0) ? 2 : 1, timeout_ms);
+
+            /* Drain available stderr bytes without blocking */
+            char discard[256];
+            for (;;) {
+                ssize_t n = read(err_pipe[0], discard, sizeof(discard));
+                if (n > 0) {
+                    if (raw_err_len + 1 < sizeof(raw_err)) {
+                        size_t copy_n = (size_t)n;
+                        if (raw_err_len + copy_n >= sizeof(raw_err)) {
+                            copy_n = sizeof(raw_err) - 1 - raw_err_len;
+                        }
+                        memcpy(raw_err + raw_err_len, discard, copy_n);
+                        raw_err_len += copy_n;
+                        raw_err[raw_err_len] = '\0';
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            pid_t w = waitpid(cmd_pid, &cmd_status, WNOHANG);
+            if (w == cmd_pid) {
+                /* Final non-blocking drain after child exit */
+                for (;;) {
+                    ssize_t n = read(err_pipe[0], discard, sizeof(discard));
+                    if (n > 0 && raw_err_len + 1 < sizeof(raw_err)) {
+                        size_t copy_n = (size_t)n;
+                        if (raw_err_len + copy_n >= sizeof(raw_err)) {
+                            copy_n = sizeof(raw_err) - 1 - raw_err_len;
+                        }
+                        memcpy(raw_err + raw_err_len, discard, copy_n);
+                        raw_err_len += copy_n;
+                        raw_err[raw_err_len] = '\0';
+                    } else {
+                        break;
+                    }
+                }
+                break;
+            } else if (w < 0 && errno != EINTR) {
+                break;
+            }
+        }
+
+        close(err_pipe[0]);
+        if (pidfd >= 0) close(pidfd);
+
+        int exit_code = 0;
+        if (WIFEXITED(cmd_status) && WEXITSTATUS(cmd_status) != 0) {
+            exit_code = WEXITSTATUS(cmd_status);
+        } else if (WIFSIGNALED(cmd_status)) {
+            int sig = WTERMSIG(cmd_status);
+            if (sig != SIGTERM && sig != SIGINT && sig != SIGHUP &&
+                sig != SIGQUIT && sig != SIGPIPE) {
+                exit_code = 128 + sig;
+            }
+        }
+
+        if (exit_code != 0) {
+            char cleaned[220];
+            clean_stderr_line(raw_err, cleaned, sizeof(cleaned));
+
+            RawCmdReport pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            pkt.exit_code = exit_code;
+            if (cleaned[0] != '\0') {
+                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d) — %s", exit_code, cleaned);
+            } else {
+                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d)", exit_code);
+            }
+
+            ssize_t nw = write(status_pipe[1], &pkt, sizeof(pkt));
+            close(status_pipe[1]);
+
+            if (nw != (ssize_t)sizeof(pkt)) {
+                /* Launcher GUI already closed after 100ms timeout: send notification */
+                char summary[128];
+                char body[512];
+                snprintf(summary, sizeof(summary), "Error (code %d)", exit_code);
+                if (cleaned[0] != '\0') {
+                    snprintf(body, sizeof(body), "%s\n%s", cmd, cleaned);
+                } else {
+                    snprintf(body, sizeof(body), "%s", cmd);
+                }
+                execlp("notify-send", "notify-send", "-u", "critical", "-a", "launcher",
+                       summary, body, (char *)NULL);
+            }
+            _exit(0);
+        }
+
+        close(status_pipe[1]);
+        _exit(0);
+    }
+
+    /* Parent (Launcher) */
+    close(status_pipe[1]);
+    int st;
+    waitpid(pid1, &st, 0);
+
+    /* Wait up to 100ms for fast command completion/failure */
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+    const int timeout_total_ms = 100;
+
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        long elapsed_ms = (ts_now.tv_sec - ts_start.tv_sec) * 1000L +
+                          (ts_now.tv_nsec - ts_start.tv_nsec) / 1000000L;
+        int rem_ms = timeout_total_ms - (int)elapsed_ms;
+        if (rem_ms <= 0) break;
+
+        struct pollfd pfd;
+        pfd.fd = status_pipe[0];
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+
+        int pr = poll(&pfd, 1, rem_ms);
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) {
+            /* Timeout reached */
+            break;
+        }
+        if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+            RawCmdReport pkt;
+            ssize_t nr = read(status_pipe[0], &pkt, sizeof(pkt));
+            close(status_pipe[0]);
+            if (nr == (ssize_t)sizeof(pkt) && pkt.exit_code != 0) {
+                if (err_out && err_out_size > 0) {
+                    strncpy(err_out, pkt.msg, err_out_size - 1);
+                    err_out[err_out_size - 1] = '\0';
+                }
+                return pkt.exit_code;
+            }
+            return 0;
+        }
+    }
+
+    /* Final non-blocking check before closing status_pipe[0] */
+    int fl = fcntl(status_pipe[0], F_GETFL, 0);
+    if (fl >= 0) {
+        fcntl(status_pipe[0], F_SETFL, fl | O_NONBLOCK);
+    }
+    RawCmdReport pkt;
+    ssize_t nr = read(status_pipe[0], &pkt, sizeof(pkt));
+    close(status_pipe[0]);
+    if (nr == (ssize_t)sizeof(pkt) && pkt.exit_code != 0) {
+        if (err_out && err_out_size > 0) {
+            strncpy(err_out, pkt.msg, err_out_size - 1);
+            err_out[err_out_size - 1] = '\0';
+        }
+        return pkt.exit_code;
+    }
+
     return 0;
 }
 
@@ -1546,17 +1911,17 @@ int launch_desktop_app(const AppEntry *app) {
     if (!app || app->exec_cmd[0] == '\0') return -1;
 
     if (!app->terminal) {
-        return launch_raw_command(app->exec_cmd);
+        return launch_detached_command(app->exec_cmd);
     }
 
     /* Terminal application requested */
     const char *term = find_terminal_emulator();
     if (!term) {
         /* Fallback: run directly if no terminal emulator found */
-        return launch_raw_command(app->exec_cmd);
+        return launch_detached_command(app->exec_cmd);
     }
 
     char term_cmd[1024];
     snprintf(term_cmd, sizeof(term_cmd), "%s -e sh -c \"%s\"", term, app->exec_cmd);
-    return launch_raw_command(term_cmd);
+    return launch_detached_command(term_cmd);
 }

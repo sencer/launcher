@@ -182,6 +182,11 @@ static void update_scroll_to_visible(LauncherState *state) {
     int vis_rows = state->layout.visible_rows > 0 ? state->layout.visible_rows : 1;
 
     state->selected_idx = clamp_val(state->selected_idx, 0, (int)state->filtered_count - 1);
+    int total_rows = ((int)state->filtered_count + cols - 1) / cols;
+    int max_scroll = total_rows - vis_rows;
+    if (max_scroll < 0) max_scroll = 0;
+    if (state->scroll_row > max_scroll) state->scroll_row = max_scroll;
+
     int sel_row = state->selected_idx / cols;
 
     if (sel_row < state->scroll_row) {
@@ -205,13 +210,18 @@ void vim_init(LauncherState *state) {
     state->selected_idx = 0;
     state->scroll_row = 0;
     state->path_status = PATH_STATUS_EMPTY;
+    state->error_msg[0] = '\0';
 }
 
 static bool handle_launch(LauncherState *state, uint32_t mods) {
     if ((mods & MOD_SHIFT) || state->focus == FOCUS_TEXTBOX || state->filtered_count == 0) {
         if (state->query_len > 0) {
-            launch_raw_command(state->query);
-            state->running = false;
+            int rc = launch_raw_command(state->query, state->error_msg, sizeof(state->error_msg));
+            if (rc == 0) {
+                state->running = false;
+            } else {
+                state->needs_redraw = true;
+            }
             return true;
         }
     } else if (state->selected_idx >= 0 && (size_t)state->selected_idx < state->filtered_count) {
@@ -319,7 +329,12 @@ static bool handle_nav_key(LauncherState *state, xkb_keysym_t sym, uint32_t mods
     }
 }
 
-bool vim_handle_key(LauncherState *state, xkb_keysym_t sym, const char *utf8, uint32_t mods) {
+static bool is_modifier_keysym(xkb_keysym_t sym) {
+    return (sym >= XKB_KEY_Shift_L && sym <= XKB_KEY_Hyper_R) ||
+           sym == XKB_KEY_Mode_switch || sym == XKB_KEY_ISO_Level3_Shift;
+}
+
+static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const char *utf8, uint32_t mods) {
     if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
         return handle_launch(state, mods);
     }
@@ -793,4 +808,14 @@ bool vim_handle_key(LauncherState *state, xkb_keysym_t sym, const char *utf8, ui
     }
 
     return false;
+}
+
+bool vim_handle_key(LauncherState *state, xkb_keysym_t sym, const char *utf8, uint32_t mods) {
+    bool had_error = false;
+    if (!is_modifier_keysym(sym) && state->error_msg[0] != '\0') {
+        state->error_msg[0] = '\0';
+        had_error = true;
+    }
+    bool handled = vim_handle_key_inner(state, sym, utf8, mods);
+    return handled || had_error;
 }

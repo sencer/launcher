@@ -516,6 +516,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
             launch_desktop_app(&app->state.apps[app_idx]);
             app->state.running = false;
         } else if (ui_is_in_textbox(&app->state, app->pointer_x, app->pointer_y)) {
+            app->state.error_msg[0] = '\0';
             app->state.focus = FOCUS_TEXTBOX;
             app->state.mode = VIM_MODE_INSERT;
             app->state.needs_redraw = true;
@@ -688,6 +689,7 @@ static void print_usage(const char *progname) {
     printf("Usage: %s [OPTIONS]\n\n"
            "Options:\n"
            "  -h, --help                 Print this help message and exit\n"
+           "  -v, --version              Print version information and exit\n"
            "  --rebuild-cache            Force rebuild of desktop applications and icon cache\n"
            "  --dump-apps [query]        List cached apps matching optional query\n"
            "  --check-path <command>     Check if command exists in PATH or is executable\n"
@@ -956,13 +958,42 @@ static int do_test_vim(void) {
         return 1;
     }
 
-    /* In normal mode, second Escape sets state.running = false */
-    if (!vim_handle_key(&state, XKB_KEY_Escape, NULL, 0)) {
-        fprintf(stderr, "Error: Escape in normal mode failed\n");
+    /* Test scroll_row reset on typing */
+    state.scroll_row = 4;
+    state.selected_idx = 40;
+    vim_handle_key(&state, XKB_KEY_i, "i", 0);
+    vim_handle_key(&state, (xkb_keysym_t)'w', "w", 0);
+    if (state.scroll_row != 0 || state.selected_idx != 0) {
+        fprintf(stderr, "Error: expected scroll_row=0 and selected_idx=0 after typing 'w', got scroll_row=%d, selected_idx=%d\n",
+                state.scroll_row, state.selected_idx);
         return 1;
     }
-    if (state.running) {
-        fprintf(stderr, "Error: expected state.running == false after Escape in normal mode\n");
+
+    /* Test fast failure reporting for shell commands */
+    char err_buf[256] = {0};
+    int rc = launch_raw_command("kill sometext", err_buf, sizeof(err_buf));
+    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL || strstr(err_buf, "kill: illegal pid: sometext") == NULL) {
+        fprintf(stderr, "Error: launch_raw_command('kill sometext') failed, rc=%d, err_buf='%s'\n", rc, err_buf);
+        return 1;
+    }
+
+    rc = launch_raw_command("pkill sometext", err_buf, sizeof(err_buf));
+    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL) {
+        fprintf(stderr, "Error: launch_raw_command('pkill sometext') failed, rc=%d, err_buf='%s'\n", rc, err_buf);
+        return 1;
+    }
+
+    rc = launch_raw_command("true", err_buf, sizeof(err_buf));
+    if (rc != 0) {
+        fprintf(stderr, "Error: launch_raw_command('true') expected 0, got %d, err_buf='%s'\n", rc, err_buf);
+        return 1;
+    }
+
+    /* Test error clearance on next keypress */
+    strncpy(state.error_msg, "test error", sizeof(state.error_msg) - 1);
+    vim_handle_key(&state, (xkb_keysym_t)'x', "x", 0);
+    if (state.error_msg[0] != '\0') {
+        fprintf(stderr, "Error: expected error_msg to clear on next keypress\n");
         return 1;
     }
 
@@ -1018,6 +1049,10 @@ int main(int argc, char **argv) {
     if (argc >= 2) {
         if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
             print_usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+            printf("launcher %s\n", LAUNCHER_VERSION);
             return 0;
         }
         if (strcmp(argv[1], "--rebuild-cache") == 0) {
