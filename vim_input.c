@@ -52,7 +52,7 @@ static void restore_undo(LauncherState *state) {
     state->undo_query[MAX_QUERY - 1] = '\0';
     state->undo_cursor = tmp_c;
 
-    state->focus = FOCUS_GRID;
+    state->history_idx = -1;
     filter_apps(state);
     state->path_status = check_path_executable(state->query);
 }
@@ -78,7 +78,7 @@ static void delete_range(LauncherState *state, int start, int end) {
     if (state->mode == VIM_MODE_NORMAL && state->query_len > 0 && state->cursor_pos >= state->query_len) {
         state->cursor_pos = state->query_len - 1;
     }
-    state->focus = FOCUS_GRID;
+    state->history_idx = -1;
     filter_apps(state);
     state->path_status = check_path_executable(state->query);
 }
@@ -199,7 +199,7 @@ static void update_scroll_to_visible(LauncherState *state) {
 
 void vim_init(LauncherState *state) {
     state->mode = VIM_MODE_INSERT;
-    state->focus = FOCUS_GRID;
+    state->focus = FOCUS_TEXTBOX;
     state->pending_op = 0;
     state->query[0] = '\0';
     state->query_len = 0;
@@ -211,11 +211,15 @@ void vim_init(LauncherState *state) {
     state->scroll_row = 0;
     state->path_status = PATH_STATUS_EMPTY;
     state->error_msg[0] = '\0';
+    state->history_count = 0;
+    state->history_idx = -1;
+    state->history_saved_query[0] = '\0';
 }
 
 static bool handle_launch(LauncherState *state, uint32_t mods) {
-    if ((mods & MOD_SHIFT) || state->focus == FOCUS_TEXTBOX || state->filtered_count == 0) {
+    if (mods & MOD_SHIFT) {
         if (state->query_len > 0) {
+            history_add(state, state->query);
             int rc = launch_raw_command(state->query, state->error_msg, sizeof(state->error_msg));
             if (rc == 0) {
                 state->running = false;
@@ -224,12 +228,36 @@ static bool handle_launch(LauncherState *state, uint32_t mods) {
             }
             return true;
         }
-    } else if (state->selected_idx >= 0 && (size_t)state->selected_idx < state->filtered_count) {
-        int app_idx = state->filtered[state->selected_idx];
-        cache_record_launch(state, app_idx);
-        launch_desktop_app(&state->apps[app_idx]);
-        state->running = false;
-        return true;
+    }
+
+    if (state->focus == FOCUS_GRID) {
+        if (state->selected_idx >= 0 && (size_t)state->selected_idx < state->filtered_count) {
+            int app_idx = state->filtered[state->selected_idx];
+            cache_record_launch(state, app_idx);
+            launch_desktop_app(&state->apps[app_idx]);
+            state->running = false;
+            return true;
+        }
+    } else {
+        /* FOCUS_TEXTBOX */
+        if (state->history_idx >= 0 || state->filtered_count == 0 || state->path_status == PATH_STATUS_VALID) {
+            if (state->query_len > 0) {
+                history_add(state, state->query);
+                int rc = launch_raw_command(state->query, state->error_msg, sizeof(state->error_msg));
+                if (rc == 0) {
+                    state->running = false;
+                } else {
+                    state->needs_redraw = true;
+                }
+                return true;
+            }
+        } else if (state->filtered_count > 0) {
+            int app_idx = state->filtered[0];
+            cache_record_launch(state, app_idx);
+            launch_desktop_app(&state->apps[app_idx]);
+            state->running = false;
+            return true;
+        }
     }
     return false;
 }
@@ -240,17 +268,28 @@ static bool handle_nav_key(LauncherState *state, xkb_keysym_t sym, uint32_t mods
 
     switch (sym) {
         case XKB_KEY_Tab:
-            if (mods & MOD_SHIFT) {
+            if (state->focus == FOCUS_TEXTBOX) {
                 if (total > 0) {
-                    state->selected_idx = (state->selected_idx - 1 + total) % total;
                     state->focus = FOCUS_GRID;
+                    state->selected_idx = 0;
+                    update_scroll_to_visible(state);
+                    return true;
+                }
+                return false;
+            }
+            /* In FOCUS_GRID */
+            if (mods & MOD_SHIFT) {
+                if (state->selected_idx == 0) {
+                    state->focus = FOCUS_TEXTBOX;
+                    return true;
+                } else if (total > 0) {
+                    state->selected_idx = (state->selected_idx - 1 + total) % total;
                     update_scroll_to_visible(state);
                     return true;
                 }
             } else {
                 if (total > 0) {
                     state->selected_idx = (state->selected_idx + 1) % total;
-                    state->focus = FOCUS_GRID;
                     update_scroll_to_visible(state);
                     return true;
                 }
@@ -258,11 +297,15 @@ static bool handle_nav_key(LauncherState *state, xkb_keysym_t sym, uint32_t mods
             return false;
 
         case XKB_KEY_ISO_Left_Tab:
-            if (total > 0) {
-                state->selected_idx = (state->selected_idx - 1 + total) % total;
-                state->focus = FOCUS_GRID;
-                update_scroll_to_visible(state);
-                return true;
+            if (state->focus == FOCUS_GRID) {
+                if (state->selected_idx == 0) {
+                    state->focus = FOCUS_TEXTBOX;
+                    return true;
+                } else if (total > 0) {
+                    state->selected_idx = (state->selected_idx - 1 + total) % total;
+                    update_scroll_to_visible(state);
+                    return true;
+                }
             }
             return false;
 
@@ -293,7 +336,25 @@ static bool handle_nav_key(LauncherState *state, xkb_keysym_t sym, uint32_t mods
             return false;
 
         case XKB_KEY_Up:
-            if (state->focus == FOCUS_GRID) {
+            if (state->focus == FOCUS_TEXTBOX) {
+                if (state->history_count > 0) {
+                    if (state->history_idx == -1) {
+                        strncpy(state->history_saved_query, state->query, sizeof(state->history_saved_query) - 1);
+                        state->history_saved_query[sizeof(state->history_saved_query) - 1] = '\0';
+                        state->history_idx = (int)state->history_count - 1;
+                    } else if (state->history_idx > 0) {
+                        state->history_idx--;
+                    }
+                    strncpy(state->query, state->history[state->history_idx], sizeof(state->query) - 1);
+                    state->query[sizeof(state->query) - 1] = '\0';
+                    state->query_len = (int)strlen(state->query);
+                    state->cursor_pos = state->query_len;
+                    filter_apps(state);
+                    state->path_status = check_path_executable(state->query);
+                    return true;
+                }
+                return false;
+            } else {
                 int cur_row = state->selected_idx / cols;
                 if (cur_row == 0) {
                     state->focus = FOCUS_TEXTBOX;
@@ -309,12 +370,32 @@ static bool handle_nav_key(LauncherState *state, xkb_keysym_t sym, uint32_t mods
 
         case XKB_KEY_Down:
             if (state->focus == FOCUS_TEXTBOX) {
-                state->focus = FOCUS_GRID;
-                if (total > 0 && state->selected_idx >= total) {
-                    state->selected_idx = total - 1;
+                if (state->history_idx >= 0) {
+                    if (state->history_idx + 1 < (int)state->history_count) {
+                        state->history_idx++;
+                        strncpy(state->query, state->history[state->history_idx], sizeof(state->query) - 1);
+                        state->query[sizeof(state->query) - 1] = '\0';
+                        state->query_len = (int)strlen(state->query);
+                        state->cursor_pos = state->query_len;
+                    } else {
+                        state->history_idx = -1;
+                        strncpy(state->query, state->history_saved_query, sizeof(state->query) - 1);
+                        state->query[sizeof(state->query) - 1] = '\0';
+                        state->query_len = (int)strlen(state->query);
+                        state->cursor_pos = state->query_len;
+                    }
+                    filter_apps(state);
+                    state->path_status = check_path_executable(state->query);
+                    return true;
+                } else {
+                    if (total > 0) {
+                        state->focus = FOCUS_GRID;
+                        state->selected_idx = 0;
+                        update_scroll_to_visible(state);
+                        return true;
+                    }
                 }
-                update_scroll_to_visible(state);
-                return true;
+                return false;
             } else {
                 if (total > 0 && state->selected_idx + cols < total) {
                     state->selected_idx += cols;
@@ -346,6 +427,16 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
         return handle_nav_key(state, sym, mods);
     }
 
+    if ((mods & MOD_CTRL) && (sym == XKB_KEY_p || sym == XKB_KEY_P)) {
+        state->pending_op = 0;
+        return handle_nav_key(state, XKB_KEY_Up, mods);
+    }
+
+    if ((mods & MOD_CTRL) && (sym == XKB_KEY_n || sym == XKB_KEY_N)) {
+        state->pending_op = 0;
+        return handle_nav_key(state, XKB_KEY_Down, mods);
+    }
+
     /* INSERT MODE */
     if (state->mode == VIM_MODE_INSERT) {
         if (sym == XKB_KEY_Escape ||
@@ -368,7 +459,8 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
                 memmove(&state->query[p], &state->query[state->cursor_pos], state->query_len - state->cursor_pos + 1);
                 state->query_len -= num;
                 state->cursor_pos = p;
-                state->focus = FOCUS_GRID;
+                state->focus = FOCUS_TEXTBOX;
+                state->history_idx = -1;
                 filter_apps(state);
                 state->path_status = check_path_executable(state->query);
                 return true;
@@ -383,7 +475,8 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
                 int num = next - state->cursor_pos;
                 memmove(&state->query[state->cursor_pos], &state->query[next], state->query_len - next + 1);
                 state->query_len -= num;
-                state->focus = FOCUS_GRID;
+                state->focus = FOCUS_TEXTBOX;
+                state->history_idx = -1;
                 filter_apps(state);
                 state->path_status = check_path_executable(state->query);
                 return true;
@@ -396,6 +489,8 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
                 save_undo(state);
                 int p = motion_b(state->query, state->query_len, state->cursor_pos);
                 delete_range(state, p, state->cursor_pos);
+                state->focus = FOCUS_TEXTBOX;
+                state->history_idx = -1;
                 return true;
             }
             return false;
@@ -405,6 +500,8 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
             if (state->cursor_pos > 0) {
                 save_undo(state);
                 delete_range(state, 0, state->cursor_pos);
+                state->focus = FOCUS_TEXTBOX;
+                state->history_idx = -1;
                 return true;
             }
             return false;
@@ -420,11 +517,12 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
             return true;
         }
 
-        if ((mods & MOD_CTRL) && (sym == XKB_KEY_n || sym == XKB_KEY_j)) {
+        if ((mods & MOD_CTRL) && sym == XKB_KEY_j) {
             int cols = state->layout.cols > 0 ? state->layout.cols : 1;
             int total = (int)state->filtered_count;
             if (state->focus == FOCUS_TEXTBOX) {
                 state->focus = FOCUS_GRID;
+                state->selected_idx = 0;
                 update_scroll_to_visible(state);
                 return true;
             } else if (total > 0 && state->selected_idx + cols < total) {
@@ -435,7 +533,7 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
             return false;
         }
 
-        if ((mods & MOD_CTRL) && (sym == XKB_KEY_p || sym == XKB_KEY_k)) {
+        if ((mods & MOD_CTRL) && sym == XKB_KEY_k) {
             int cols = state->layout.cols > 0 ? state->layout.cols : 1;
             if (state->focus == FOCUS_GRID) {
                 if (state->selected_idx / cols == 0) {
@@ -463,7 +561,8 @@ static bool vim_handle_key_inner(LauncherState *state, xkb_keysym_t sym, const c
                     state->query_len += (int)ulen;
                     state->cursor_pos += (int)ulen;
                     state->query[state->query_len] = '\0';
-                    state->focus = FOCUS_GRID;
+                    state->focus = FOCUS_TEXTBOX;
+                    state->history_idx = -1;
                     filter_apps(state);
                     state->path_status = check_path_executable(state->query);
                     return true;

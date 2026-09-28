@@ -7,12 +7,13 @@
 #include <xkbcommon/xkbcommon.h>
 
 #ifndef LAUNCHER_VERSION
-#define LAUNCHER_VERSION "0.1.3"
+#define LAUNCHER_VERSION "0.1.4"
 #endif
 
 #define ICON_SIZE 64
 #define MAX_APPS 512
 #define MAX_QUERY 256
+#define MAX_HISTORY 512
 
 typedef enum {
     PATH_STATUS_INVALID = -1,
@@ -87,6 +88,11 @@ typedef struct {
     bool running;
     bool needs_redraw;
     char error_msg[256];
+
+    char history[MAX_HISTORY][MAX_QUERY];
+    size_t history_count;
+    int history_idx;
+    char history_saved_query[MAX_QUERY];
 } LauncherState;
 
 /* desktop_cache.c */
@@ -97,6 +103,8 @@ void filter_apps(LauncherState *state);
 PathStatus check_path_executable(const char *query);
 int launch_desktop_app(const AppEntry *app);
 int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size);
+void history_load(LauncherState *state);
+void history_add(LauncherState *state, const char *cmd);
 
 /* vim_input.c */
 void vim_init(LauncherState *state);

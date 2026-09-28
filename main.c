@@ -972,13 +972,13 @@ static int do_test_vim(void) {
     /* Test fast failure reporting for shell commands */
     char err_buf[256] = {0};
     int rc = launch_raw_command("kill sometext", err_buf, sizeof(err_buf));
-    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL || strstr(err_buf, "illegal pid: sometext") == NULL) {
+    if (rc == 0 || strstr(err_buf, "Err 1") == NULL || strstr(err_buf, "illegal pid: sometext") == NULL) {
         fprintf(stderr, "Error: launch_raw_command('kill sometext') failed, rc=%d, err_buf='%s'\n", rc, err_buf);
         return 1;
     }
 
     rc = launch_raw_command("pkill sometext", err_buf, sizeof(err_buf));
-    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL) {
+    if (rc == 0 || strstr(err_buf, "Err 1") == NULL) {
         fprintf(stderr, "Error: launch_raw_command('pkill sometext') failed, rc=%d, err_buf='%s'\n", rc, err_buf);
         return 1;
     }
@@ -996,6 +996,91 @@ static int do_test_vim(void) {
         fprintf(stderr, "Error: expected error_msg to clear on next keypress\n");
         return 1;
     }
+
+    /* Test Command History & Focus Navigation */
+    vim_init(&state);
+    state.filtered_count = 5;
+    state.layout.cols = 4;
+    state.layout.visible_rows = 2;
+
+    if (state.focus != FOCUS_TEXTBOX) {
+        fprintf(stderr, "Error: expected initial focus == FOCUS_TEXTBOX\n");
+        return 1;
+    }
+
+    /* Test Tab focuses grid */
+    vim_handle_key(&state, XKB_KEY_Tab, NULL, 0);
+    if (state.focus != FOCUS_GRID || state.selected_idx != 0) {
+        fprintf(stderr, "Error: Tab failed to switch focus to FOCUS_GRID\n");
+        return 1;
+    }
+
+    /* Test Shift-Tab at index 0 returns to FOCUS_TEXTBOX */
+    vim_handle_key(&state, XKB_KEY_ISO_Left_Tab, NULL, 0);
+    if (state.focus != FOCUS_TEXTBOX) {
+        fprintf(stderr, "Error: Shift-Tab failed to return focus to FOCUS_TEXTBOX\n");
+        return 1;
+    }
+
+    /* Test Up/Down history navigation */
+    setenv("XDG_CACHE_HOME", "/tmp/launcher_test_cache", 1);
+    state.history_count = 0;
+    history_add(&state, "echo first");
+    history_add(&state, "echo second");
+    history_add(&state, "echo third");
+
+    /* Type something in textbox */
+    strncpy(state.query, "my typed cmd", sizeof(state.query) - 1);
+    state.query_len = (int)strlen(state.query);
+    state.cursor_pos = state.query_len;
+
+    /* Up Arrow -> loads "echo third" */
+    vim_handle_key(&state, XKB_KEY_Up, NULL, 0);
+    if (strcmp(state.query, "echo third") != 0 || state.history_idx != 2) {
+        fprintf(stderr, "Error: Up failed to load latest history item, got '%s'\n", state.query);
+        return 1;
+    }
+
+    /* Ctrl-P -> loads "echo second" */
+    vim_handle_key(&state, XKB_KEY_p, NULL, MOD_CTRL);
+    if (strcmp(state.query, "echo second") != 0 || state.history_idx != 1) {
+        fprintf(stderr, "Error: Ctrl-P failed to load previous history item, got '%s'\n", state.query);
+        return 1;
+    }
+
+    /* Ctrl-N -> loads "echo third" */
+    vim_handle_key(&state, XKB_KEY_n, NULL, MOD_CTRL);
+    if (strcmp(state.query, "echo third") != 0 || state.history_idx != 2) {
+        fprintf(stderr, "Error: Ctrl-N failed to load next history item, got '%s'\n", state.query);
+        return 1;
+    }
+
+    /* Down Arrow -> restores original "my typed cmd" */
+    vim_handle_key(&state, XKB_KEY_Down, NULL, 0);
+    if (strcmp(state.query, "my typed cmd") != 0 || state.history_idx != -1) {
+        fprintf(stderr, "Error: Down failed to restore typed query, got '%s'\n", state.query);
+        return 1;
+    }
+
+    /* Down Arrow again when not in history -> focuses grid */
+    state.filtered_count = 5;
+    vim_handle_key(&state, XKB_KEY_Down, NULL, 0);
+    if (state.focus != FOCUS_GRID || state.selected_idx != 0) {
+        fprintf(stderr, "Error: Down when not in history failed to focus grid\n");
+        return 1;
+    }
+
+    /* Up on row 0 returns focus to textbox */
+    vim_handle_key(&state, XKB_KEY_Up, NULL, 0);
+    if (state.focus != FOCUS_TEXTBOX) {
+        fprintf(stderr, "Error: Up on row 0 failed to return to FOCUS_TEXTBOX\n");
+        return 1;
+    }
+
+    unlink("/tmp/launcher_test_cache/launcher/history");
+    rmdir("/tmp/launcher_test_cache/launcher");
+    rmdir("/tmp/launcher_test_cache");
+    unsetenv("XDG_CACHE_HOME");
 
     printf("VIM_TESTS_PASSED\n");
     return 0;
@@ -1127,6 +1212,7 @@ int main(int argc, char **argv) {
     }
 
     vim_init(&app.state);
+    history_load(&app.state);
 
     /* Initialize XKB context */
     app.xkb_ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);

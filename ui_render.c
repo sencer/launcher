@@ -704,7 +704,7 @@ void ui_render_frame(LauncherState *state, uint32_t *argb_buf, uint32_t width, u
         border_col = 0xFFE74C3C; // bright red on command error
     } else if (state->path_status == PATH_STATUS_VALID) {
         border_col = 0xFF2ECC71; // bright green
-    } else if (state->path_status == PATH_STATUS_INVALID) {
+    } else if (state->path_status == PATH_STATUS_INVALID && state->filtered_count == 0) {
         border_col = 0xFFE74C3C; // bright red
     } else {
         if (state->focus == FOCUS_TEXTBOX) {

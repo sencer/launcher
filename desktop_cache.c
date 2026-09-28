@@ -99,6 +99,83 @@ static void get_cache_path(char *out, size_t maxlen) {
     snprintf(out, maxlen, "%s/cache.bin", dir);
 }
 
+static void get_history_path(char *out, size_t maxlen) {
+    char dir[PATH_BUF_SIZE];
+    const char *xdg_cache = getenv("XDG_CACHE_HOME");
+    if (xdg_cache && xdg_cache[0] != '\0') {
+        snprintf(dir, sizeof(dir), "%s/launcher", xdg_cache);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home) home = "/tmp";
+        snprintf(dir, sizeof(dir), "%s/.cache/launcher", home);
+    }
+    mkdir(dir, 0755);
+    snprintf(out, maxlen, "%s/history", dir);
+}
+
+void history_load(LauncherState *state) {
+    if (!state) return;
+    state->history_count = 0;
+    state->history_idx = -1;
+    state->history_saved_query[0] = '\0';
+
+    char path[PATH_BUF_SIZE];
+    get_history_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[MAX_QUERY];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        if (state->history_count < MAX_HISTORY) {
+            strncpy(state->history[state->history_count], line, MAX_QUERY - 1);
+            state->history[state->history_count][MAX_QUERY - 1] = '\0';
+            state->history_count++;
+        } else {
+            memmove(&state->history[0], &state->history[1], (MAX_HISTORY - 1) * MAX_QUERY);
+            strncpy(state->history[MAX_HISTORY - 1], line, MAX_QUERY - 1);
+            state->history[MAX_HISTORY - 1][MAX_QUERY - 1] = '\0';
+        }
+    }
+    fclose(f);
+}
+
+void history_add(LauncherState *state, const char *cmd) {
+    if (!cmd) return;
+    while (isspace((unsigned char)*cmd)) cmd++;
+    if (*cmd == '\0') return;
+
+    if (state && state->history_count > 0 &&
+        strcmp(state->history[state->history_count - 1], cmd) == 0) {
+        return;
+    }
+
+    char path[PATH_BUF_SIZE];
+    get_history_path(path, sizeof(path));
+    FILE *f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "%s\n", cmd);
+        fclose(f);
+    }
+
+    if (state) {
+        if (state->history_count < MAX_HISTORY) {
+            strncpy(state->history[state->history_count], cmd, MAX_QUERY - 1);
+            state->history[state->history_count][MAX_QUERY - 1] = '\0';
+            state->history_count++;
+        } else {
+            memmove(&state->history[0], &state->history[1], (MAX_HISTORY - 1) * MAX_QUERY);
+            strncpy(state->history[MAX_HISTORY - 1], cmd, MAX_QUERY - 1);
+            state->history[MAX_HISTORY - 1][MAX_QUERY - 1] = '\0';
+        }
+    }
+}
+
 /* Get list of desktop directories to scan */
 #define MAX_SEARCH_DIRS 64
 static int get_desktop_dirs(char dirs[MAX_SEARCH_DIRS][PATH_BUF_SIZE]) {
@@ -1789,9 +1866,9 @@ int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
             memset(&pkt, 0, sizeof(pkt));
             pkt.exit_code = exit_code;
             if (cleaned[0] != '\0') {
-                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d): %s", exit_code, cleaned);
+                snprintf(pkt.msg, sizeof(pkt.msg), "Err %d: %s", exit_code, cleaned);
             } else {
-                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d)", exit_code);
+                snprintf(pkt.msg, sizeof(pkt.msg), "Err %d", exit_code);
             }
 
             ssize_t nw = write(status_pipe[1], &pkt, sizeof(pkt));
@@ -1799,15 +1876,13 @@ int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
 
             if (nw != (ssize_t)sizeof(pkt)) {
                 /* Launcher GUI already closed after 100ms timeout: send notification */
-                char summary[128];
-                char body[1024];
-                snprintf(summary, sizeof(summary), "Launcher command failed");
+                char summary[256];
+                char body[512];
+                snprintf(summary, sizeof(summary), "%s failed", cmd);
                 if (cleaned[0] != '\0') {
-                    snprintf(body, sizeof(body), "Command \"%s\" failed.\nError (code %d): %s",
-                             cmd, exit_code, cleaned);
+                    snprintf(body, sizeof(body), "Err %d: %s", exit_code, cleaned);
                 } else {
-                    snprintf(body, sizeof(body), "Command \"%s\" failed.\nError (code %d)",
-                             cmd, exit_code);
+                    snprintf(body, sizeof(body), "Err %d", exit_code);
                 }
                 execlp("notify-send", "notify-send", "-u", "critical", "-a", "launcher",
                        "-i", "utilities-terminal", summary, body, (char *)NULL);

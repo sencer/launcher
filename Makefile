@@ -1,4 +1,4 @@
-VERSION ?= 0.1.3
+VERSION ?= 0.1.4
 ARCH_FLAGS ?= -march=native
 CC ?= gcc
 CFLAGS ?= -O3 $(ARCH_FLAGS) -flto=auto -fno-plt -Wall -Wextra -Wno-maybe-uninitialized -DLAUNCHER_VERSION=\"$(VERSION)\" -I/usr/include/freetype2 -I/usr/include/libpng16
