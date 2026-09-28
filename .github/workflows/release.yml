@@ -1,0 +1,131 @@
+name: Release Linux Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_name: launcher-x86_64-unknown-linux-gnu
+            use_docker: false
+            apt_packages: libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libpng-dev libbz2-dev zlib1g-dev libbrotli-dev pkg-config
+            c_compiler: gcc
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive_name: launcher-aarch64-unknown-linux-gnu
+            use_docker: false
+            apt_packages: libwayland-dev wayland-protocols libxkbcommon-dev libfreetype-dev libpng-dev libbz2-dev zlib1g-dev libbrotli-dev pkg-config
+            c_compiler: gcc
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive_name: launcher-x86_64-unknown-linux-musl
+            use_docker: true
+            apt_packages: ""
+            c_compiler: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Host)
+        if: matrix.use_docker == false && matrix.apt_packages != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Build launcher binary (Host)
+        if: matrix.use_docker == false
+        run: |
+          make CC=${{ matrix.c_compiler }} ARCH_FLAGS=""
+
+      - name: Build launcher binary (Docker / Alpine musl)
+        if: matrix.use_docker == true
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace alpine:latest sh -euxc "
+            apk add --no-cache build-base pkgconf wayland-dev wayland-protocols libxkbcommon-dev freetype-dev freetype-static libpng-dev libpng-static bzip2-dev bzip2-static zlib-dev zlib-static brotli-dev brotli-static
+            make ARCH_FLAGS=\"\"
+            chmod -R a+rw launcher .libs
+          "
+
+      - name: Package release archive
+        run: |
+          STAGING_DIR="${{ matrix.archive_name }}"
+          mkdir -p "$STAGING_DIR"
+          cp launcher "$STAGING_DIR/launcher"
+          if [ -f README.md ]; then
+            cp README.md "$STAGING_DIR/README.md"
+          fi
+          tar -czvf "${{ matrix.archive_name }}.tar.gz" -C "$STAGING_DIR" .
+          sha256sum "${{ matrix.archive_name }}.tar.gz" > "${{ matrix.archive_name }}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive_name }}
+          path: |
+            ${{ matrix.archive_name }}.tar.gz
+            ${{ matrix.archive_name }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: build-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release_assets
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.sha256" \) -exec cp {} release_assets/ \;
+          cd release_assets
+          cat *.sha256 > SHA256SUMS.txt
+          ls -la
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            echo "TAG_NAME=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            VERSION=$(grep '^VERSION *?=' Makefile | head -n1 | awk '{print $3}')
+            echo "TAG_NAME=v${VERSION}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG_NAME }}
+          name: Launcher ${{ steps.tag.outputs.TAG_NAME }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release_assets/*.tar.gz
+            release_assets/SHA256SUMS.txt

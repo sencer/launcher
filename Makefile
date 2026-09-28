@@ -1,5 +1,7 @@
+VERSION ?= 0.1.0
+ARCH_FLAGS ?= -march=native
 CC ?= gcc
-CFLAGS ?= -O3 -march=native -flto=auto -fno-plt -Wall -Wextra -Wno-maybe-uninitialized -I/usr/include/freetype2 -I/usr/include/libpng16
+CFLAGS ?= -O3 $(ARCH_FLAGS) -flto=auto -fno-plt -Wall -Wextra -Wno-maybe-uninitialized -I/usr/include/freetype2 -I/usr/include/libpng16
 LDFLAGS ?= -Wl,-O1,--as-needed,-z,now -s
 STATIC_LIBS = -L.libs -Wl,-Bstatic -lfreetype -lpng16 -lbz2 -lz -lbrotlidec -lbrotlicommon
 DYNAMIC_LIBS = -Wl,-Bdynamic -lwayland-client -lxkbcommon -lm
