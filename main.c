@@ -972,7 +972,7 @@ static int do_test_vim(void) {
     /* Test fast failure reporting for shell commands */
     char err_buf[256] = {0};
     int rc = launch_raw_command("kill sometext", err_buf, sizeof(err_buf));
-    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL || strstr(err_buf, "kill: illegal pid: sometext") == NULL) {
+    if (rc == 0 || strstr(err_buf, "Error (code 1)") == NULL || strstr(err_buf, "illegal pid: sometext") == NULL) {
         fprintf(stderr, "Error: launch_raw_command('kill sometext') failed, rc=%d, err_buf='%s'\n", rc, err_buf);
         return 1;
     }

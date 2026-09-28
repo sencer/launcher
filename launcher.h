@@ -7,7 +7,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #ifndef LAUNCHER_VERSION
-#define LAUNCHER_VERSION "0.1.2"
+#define LAUNCHER_VERSION "0.1.3"
 #endif
 
 #define ICON_SIZE 64

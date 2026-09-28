@@ -1548,15 +1548,13 @@ static void clean_stderr_line(const char *raw, char *out, size_t out_max) {
         if (q > after_zsh && strncmp(q, ": ", 2) == 0) {
             p = q + 2;
         } else {
-            /* Case 2: "zsh:<builtin>:<line>: <msg>" -> "<builtin>: <msg>" */
+            /* Case 2: "zsh:<builtin>:<line>: <msg>" -> "<msg>" */
             const char *colon = strchr(after_zsh, ':');
             if (colon && colon > after_zsh) {
                 const char *r = colon + 1;
                 while (isdigit((unsigned char)*r)) r++;
                 if (r > colon + 1 && strncmp(r, ": ", 2) == 0) {
-                    size_t b_len = (size_t)(colon - after_zsh);
-                    snprintf(out, out_max, "%.*s: %s", (int)b_len, after_zsh, r + 2);
-                    return;
+                    p = r + 2;
                 }
             }
         }
@@ -1791,7 +1789,7 @@ int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
             memset(&pkt, 0, sizeof(pkt));
             pkt.exit_code = exit_code;
             if (cleaned[0] != '\0') {
-                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d) — %s", exit_code, cleaned);
+                snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d): %s", exit_code, cleaned);
             } else {
                 snprintf(pkt.msg, sizeof(pkt.msg), "Error (code %d)", exit_code);
             }
@@ -1802,12 +1800,14 @@ int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
             if (nw != (ssize_t)sizeof(pkt)) {
                 /* Launcher GUI already closed after 100ms timeout: send notification */
                 char summary[128];
-                char body[512];
-                snprintf(summary, sizeof(summary), "Error (code %d)", exit_code);
+                char body[1024];
+                snprintf(summary, sizeof(summary), "Launcher command failed");
                 if (cleaned[0] != '\0') {
-                    snprintf(body, sizeof(body), "%s\n%s", cmd, cleaned);
+                    snprintf(body, sizeof(body), "Command \"%s\" failed.\nError (code %d): %s",
+                             cmd, exit_code, cleaned);
                 } else {
-                    snprintf(body, sizeof(body), "%s", cmd);
+                    snprintf(body, sizeof(body), "Command \"%s\" failed.\nError (code %d)",
+                             cmd, exit_code);
                 }
                 execlp("notify-send", "notify-send", "-u", "critical", "-a", "launcher",
                        "-i", "utilities-terminal", summary, body, (char *)NULL);
