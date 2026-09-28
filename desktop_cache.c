@@ -1810,7 +1810,7 @@ int launch_raw_command(const char *cmd, char *err_out, size_t err_out_size) {
                     snprintf(body, sizeof(body), "%s", cmd);
                 }
                 execlp("notify-send", "notify-send", "-u", "critical", "-a", "launcher",
-                       summary, body, (char *)NULL);
+                       "-i", "utilities-terminal", summary, body, (char *)NULL);
             }
             _exit(0);
         }
